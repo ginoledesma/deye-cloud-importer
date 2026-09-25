@@ -9,7 +9,7 @@ Endpoints used (see https://developer.deyecloud.com/api):
   POST /v1.0/account/token?appId=...   -> accessToken
   POST /v1.0/station/list              -> your stations and their ids
   POST /v1.0/station/history           -> granularity 1 = frames for one day,
-                                          granularity 2 = daily totals (<=31 days/call)
+                                          granularity 2 = daily totals (30 days/call)
 
 Usage:
   python deye_export.py stations
@@ -53,6 +53,8 @@ POWER_FIELDS = [
     "dischargePower",
     "irradiateIntensity",
 ]
+# Days per granularity=2 request (see DeyeClient.station_daily).
+DAILY_CHUNK_DAYS = 30
 # Signed fields that get split into positive/negative energy in the hourly roll-up.
 SIGNED_FIELDS = ["gridPower", "batteryPower"]
 
@@ -176,7 +178,11 @@ class DeyeClient:
         return data.get("stationDataItems") or []
 
     def station_daily(self, station_id: int, start: date, end_exclusive: date) -> list[dict]:
-        """Daily energy totals, start..end_exclusive (API allows at most 31 days)."""
+        """Daily energy totals, start..end_exclusive.
+
+        The docs say "up to 31 days", but the API answers a 31-day span with
+        code 2101012 "should be within 31 days", so callers use 30.
+        """
         data = self._request("station/history", {
             "stationId": station_id, "granularity": 2,
             "startAt": start.isoformat(), "endAt": end_exclusive.isoformat(),
@@ -377,10 +383,18 @@ def cmd_hourly(client, args, env) -> None:
 def cmd_daily(client: DeyeClient, args, env) -> None:
     station = resolve_station(client, env, args)
     rows: dict[str, dict] = {}
+    failed = 0
     start = args.start
     while start <= args.end:
-        end_excl = min(start + timedelta(days=31), args.end + timedelta(days=1))
-        for item in client.station_daily(station, start, end_excl):
+        end_excl = min(start + timedelta(days=DAILY_CHUNK_DAYS), args.end + timedelta(days=1))
+        try:
+            items = client.station_daily(station, start, end_excl)
+        except DeyeError as e:
+            print(f"daily: {start} .. {end_excl - timedelta(days=1)}: ERROR {e}", file=sys.stderr)
+            failed += 1
+            start = end_excl
+            continue
+        for item in items:
             y, m, d = item.get("year"), item.get("month"), item.get("day")
             if not (y and m and d):
                 continue
@@ -393,6 +407,8 @@ def cmd_daily(client: DeyeClient, args, env) -> None:
     path = Path(args.out) / "daily.csv"
     write_csv(path, [rows[k] for k in sorted(rows)], ["date"])
     print(f"daily: {len(rows)} days -> {path}")
+    if failed:
+        print(f"daily: {failed} chunk(s) failed; re-run 'daily' to retry.", file=sys.stderr)
 
 
 def cmd_all(client, args, env) -> None:

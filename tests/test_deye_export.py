@@ -113,7 +113,7 @@ def test_frames_command_is_resumable(tmp_path):
     assert "consumptionPower_kWh" in (tmp_path / "hourly.csv").read_text()
 
 
-def test_daily_command_chunks_by_31_days(tmp_path):
+def test_daily_command_chunks_by_30_days(tmp_path):
     requested = []
 
     def history(body):
@@ -129,7 +129,7 @@ def test_daily_command_chunks_by_31_days(tmp_path):
     args = dx.build_parser().parse_args(
         ["--out", str(tmp_path), "daily", "--station", "7", "--start", "2026-01-01", "--end", "2026-03-05"])
     dx.cmd_daily(client, args, {})
-    assert requested == [("2026-01-01", "2026-02-01"), ("2026-02-01", "2026-03-04"), ("2026-03-04", "2026-03-06")]
+    assert requested == [("2026-01-01", "2026-01-31"), ("2026-01-31", "2026-03-02"), ("2026-03-02", "2026-03-06")]
     lines = (tmp_path / "daily.csv").read_text().splitlines()
     assert lines[0].startswith("date,") and len(lines) == 1 + 64
 
@@ -152,3 +152,17 @@ def test_station_defaults_for_tz_and_start(tmp_path):
     dx.cmd_frames(client, args, {})
     assert args.tz == "Asia/Manila"
     assert requested == ["2026-09-26", "2026-09-27"]
+
+
+def test_daily_chunk_error_is_reported_not_fatal(tmp_path, capsys):
+    def history(body):
+        if body["startAt"] == "2026-01-01":
+            return {"code": "2101012", "success": False, "msg": "should be within 31 days"}
+        return ok(stationDataItems=[{"year": 2026, "month": 2, "day": 1, "consumptionValue": 5.0}])
+
+    client, _ = make_client({"station/history": history})
+    args = dx.build_parser().parse_args(
+        ["--out", str(tmp_path), "daily", "--station", "7", "--start", "2026-01-01", "--end", "2026-02-10"])
+    dx.cmd_daily(client, args, {})
+    assert "2101012" in capsys.readouterr().err
+    assert "2026-02-01" in (tmp_path / "daily.csv").read_text()
