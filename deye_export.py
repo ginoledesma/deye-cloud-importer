@@ -42,13 +42,14 @@ DEFAULT_BASE_URL = "https://eu1-developer.deyecloud.com"
 
 # Station frame fields that hold instantaneous power. The API reports them in
 # watts; the website export shows kW, so they are converted.
+# Column mapping checked against a website export: all 289 frames of a day match.
 POWER_FIELDS = [
-    "generationPower",   # website: Production
+    "generationPower",   # website: Production (and PV, when there's no generator)
     "consumptionPower",  # website: Consumption
-    "gridPower",         # website: Grid
-    "purchasePower",     # power bought from the grid
-    "wirePower",         # power fed into the grid
-    "batteryPower",      # website: Battery (positive = discharging)
+    "wirePower",         # website: Grid (positive = buying, negative = exporting)
+    "batteryPower",      # website: Battery (positive = discharging, negative = charging)
+    "purchasePower",     # buying side of wirePower only
+    "gridPower",         # exporting side of wirePower only
     "chargePower",
     "dischargePower",
     "irradiateIntensity",
@@ -56,7 +57,7 @@ POWER_FIELDS = [
 # Days per granularity=2 request (see DeyeClient.station_daily).
 DAILY_CHUNK_DAYS = 30
 # Signed fields that get split into positive/negative energy in the hourly roll-up.
-SIGNED_FIELDS = ["gridPower", "batteryPower"]
+SIGNED_FIELDS = ["wirePower", "batteryPower"]
 
 
 # --------------------------------------------------------------------------- config
@@ -255,7 +256,8 @@ def write_csv(path: Path, rows: list[dict], lead: list[str] | None = None) -> No
 
 
 def frame_columns() -> list[str]:
-    return ["time"] + [f"{k}_kW" for k in POWER_FIELDS[:6]] + ["batterySOC"]
+    return ["time"] + [f"{k}_kW" for k in POWER_FIELDS[:4]] + ["batterySOC"] + \
+        [f"{k}_kW" for k in POWER_FIELDS[4:6]]
 
 
 def hourly_rollup(frame_rows: list[dict]) -> list[dict]:

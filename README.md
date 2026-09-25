@@ -48,26 +48,26 @@ file, so you can stop it and run it again: days already downloaded are skipped
 | File | What it holds |
 | --- | --- |
 | `frames/YYYY-MM-DD.csv` | ~5-minute power readings in kW, the same data as the website's History export (see below) |
-| `hourly.csv` | kWh per hour for each power column (average kW over the hour × 1 h), with `samples` = number of readings behind it (12 = a complete hour). Grid and battery are also split into `_pos_kWh` / `_neg_kWh` |
+| `hourly.csv` | kWh per hour for each power column (average kW over the hour × 1 h), with `samples` = number of readings behind it (12 = a complete hour). Grid and battery are also split in two: `wirePower_pos_kWh` = bought from the grid, `wirePower_neg_kWh` = exported, `batteryPower_pos_kWh` = discharged, `batteryPower_neg_kWh` = charged |
 | `daily.csv` | Deye's daily totals in kWh: `generationValue`, `consumptionValue`, `purchaseValue` (bought from grid), `gridValue` (fed into grid), `chargeValue`, `dischargeValue`, … |
 
-How the frame columns line up with the website export:
+How the frame columns line up with the website export (checked against a
+full day's export: every reading matches):
 
 | Website column | API field |
 | --- | --- |
 | Production (kW) | `generationPower_kW` |
 | Consumption (kW) | `consumptionPower_kW` |
-| Grid (kW) | `gridPower_kW` (also `purchasePower_kW` = bought, `wirePower_kW` = fed in) |
-| Battery (kW) | `batteryPower_kW` (positive = discharging) |
+| Grid (kW) | `wirePower_kW` (positive = buying, negative = exporting) |
+| Battery (kW) | `batteryPower_kW` (positive = discharging, negative = charging) |
 | SOC (%) | `batterySOC` |
 
 The API doesn't return the website's PV, Generator and Grid-tied Inverter
-columns at station level. Those would need the per-device `/v1.0/device/history`
-endpoint (see [stoflom/deye-logger](https://github.com/stoflom/deye-logger)).
+columns at station level. Without a generator, PV equals Production. The other two
+columns need the per-device endpoint. That's `/v1.0/device/history`
+(see [stoflom/deye-logger](https://github.com/stoflom/deye-logger)).
 
-The API documentation doesn't give units. The tool assumes power comes back in
-watts and divides by 1000. Compare one day's `frames/*.csv` with a website
-export. If the values are 1000× too small, re-run with `--power-divisor 1 --refetch`.
+Power values come back from the API in watts and are converted to kW.
 
 ## Tests
 
