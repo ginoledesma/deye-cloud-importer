@@ -1,0 +1,154 @@
+import sys
+from datetime import date
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import deye_export as dx  # noqa: E402
+
+TZ = ZoneInfo("Asia/Manila")
+
+
+class FakeResponse:
+    def __init__(self, body, status=200):
+        self.body, self.status_code = body, status
+
+    def json(self):
+        return self.body
+
+    def raise_for_status(self):
+        pass
+
+
+class FakeSession:
+    """Answers Deye endpoints from a dict of path -> callable(body) -> response body."""
+
+    def __init__(self, routes):
+        self.routes, self.calls = routes, []
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        path = url.split("/v1.0/", 1)[1].split("?", 1)[0]
+        self.calls.append((path, json, headers))
+        return FakeResponse(self.routes[path](json))
+
+
+def ok(**kw):
+    return {"code": "1000000", "success": True, "msg": "success", **kw}
+
+
+def make_client(routes):
+    session = FakeSession({"account/token": lambda b: ok(accessToken="tok", expiresIn=5000), **routes})
+    return dx.DeyeClient("https://x", "app", "sec", {"email": "a@b"}, "hash", session=session, delay=0), session
+
+
+def test_token_then_bearer_and_password_hash():
+    client, session = make_client({"station/list": lambda b: ok(total=1, stationList=[{"id": 7, "name": "Home"}])})
+    assert client.stations() == [{"id": 7, "name": "Home"}]
+    token_call, list_call = session.calls
+    assert token_call[1] == {"appSecret": "sec", "password": "hash", "email": "a@b"}
+    assert list_call[2]["Authorization"] == "Bearer tok"
+    assert dx.password_hash({"DEYE_PASSWORD": "123456"}) == \
+        "8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92"
+
+
+def test_api_error_raises():
+    client, _ = make_client({"station/list": lambda b: {"code": "2101019", "success": False, "msg": "bad"}})
+    try:
+        client.stations()
+    except dx.DeyeError as e:
+        assert "bad" in str(e)
+    else:
+        raise AssertionError("expected DeyeError")
+
+
+def test_frames_to_rows_converts_watts_and_local_time():
+    # 2026-09-26 00:00 and 00:05 Manila time, out of order and with a duplicate.
+    items = [
+        {"timeStamp": 1790352300, "generationPower": 0, "consumptionPower": 2250.0, "batteryPower": 2420, "batterySOC": 58},
+        {"timeStamp": "1790352000", "generationPower": 0, "consumptionPower": 2090.0, "batteryPower": 2250, "batterySOC": 58},
+        {"timeStamp": 1790352000000, "generationPower": 0, "consumptionPower": 2090.0, "batteryPower": 2250, "batterySOC": 58},
+    ]
+    rows = dx.frames_to_rows(items, TZ, 1000)
+    assert [r["time"] for r in rows] == ["2026-09-26 00:00:00", "2026-09-26 00:05:00"]
+    assert rows[0]["consumptionPower_kW"] == 2.09
+    assert rows[0]["batteryPower_kW"] == 2.25
+    assert rows[0]["batterySOC"] == 58
+
+
+def test_hourly_rollup():
+    rows = [{"time": f"2026-09-26 00:{m:02d}:00", "consumptionPower_kW": "2.0",
+             "batteryPower_kW": "3.0" if m < 30 else "-1.0", "batterySOC": str(60 - m // 5)}
+            for m in range(0, 60, 5)]
+    rows.append({"time": "2026-09-26 01:00:00", "consumptionPower_kW": "1.0", "batteryPower_kW": "",
+                 "batterySOC": "48"})
+    h0, h1 = dx.hourly_rollup(rows)
+    assert h0["samples"] == 12 and h0["consumptionPower_kWh"] == 2.0
+    assert h0["batteryPower_pos_kWh"] == 1.5 and h0["batteryPower_neg_kWh"] == 0.5
+    assert h0["batteryPower_kWh"] == 1.0
+    assert (h0["batterySOC_min"], h0["batterySOC_max"], h0["batterySOC_end"]) == (49, 60, 49)
+    assert h1["samples"] == 1 and "batteryPower_kWh" not in h1
+
+
+def test_frames_command_is_resumable(tmp_path):
+    requested = []
+
+    def history(body):
+        requested.append(body)
+        return ok(stationDataItems=[{"timeStamp": 1790352000, "consumptionPower": 1000}])
+
+    client, _ = make_client({"station/history": history})
+    args = dx.build_parser().parse_args(
+        ["--out", str(tmp_path), "frames", "--station", "7", "--start", "2026-09-01",
+         "--end", "2026-09-02", "--tz", "Asia/Manila"])
+    dx.cmd_frames(client, args, {})
+    assert [b["startAt"] for b in requested] == ["2026-09-01", "2026-09-02"]
+    assert requested[0] == {"stationId": 7, "granularity": 1, "startAt": "2026-09-01", "endAt": "2026-09-02"}
+    assert (tmp_path / "frames" / "2026-09-01.csv").exists()
+
+    requested.clear()
+    dx.cmd_frames(client, args, {})
+    assert requested == []  # both days already on disk
+
+    dx.cmd_hourly(None, args, {})
+    assert "consumptionPower_kWh" in (tmp_path / "hourly.csv").read_text()
+
+
+def test_daily_command_chunks_by_31_days(tmp_path):
+    requested = []
+
+    def history(body):
+        requested.append((body["startAt"], body["endAt"]))
+        start = date.fromisoformat(body["startAt"])
+        # Include the (possibly inclusive) end day to check it is de-duplicated.
+        end = date.fromisoformat(body["endAt"])
+        days = [start + dx.timedelta(days=i) for i in range((end - start).days + 1)]
+        return ok(stationDataItems=[{"year": d.year, "month": d.month, "day": d.day,
+                                     "consumptionValue": 10.0} for d in days])
+
+    client, _ = make_client({"station/history": history})
+    args = dx.build_parser().parse_args(
+        ["--out", str(tmp_path), "daily", "--station", "7", "--start", "2026-01-01", "--end", "2026-03-05"])
+    dx.cmd_daily(client, args, {})
+    assert requested == [("2026-01-01", "2026-02-01"), ("2026-02-01", "2026-03-04"), ("2026-03-04", "2026-03-06")]
+    lines = (tmp_path / "daily.csv").read_text().splitlines()
+    assert lines[0].startswith("date,") and len(lines) == 1 + 64
+
+
+def test_token_with_bearer_prefix_is_not_doubled():
+    client, session = make_client({"station/list": lambda b: ok(total=0, stationList=[])})
+    session.routes["account/token"] = lambda b: ok(accessToken="Bearer tok", expiresIn="5183999")
+    client.stations()
+    assert session.calls[-1][2]["Authorization"] == "Bearer tok"
+
+
+def test_station_defaults_for_tz_and_start(tmp_path):
+    station = {"id": 7, "name": "Home", "regionTimezone": "Asia/Manila", "startOperatingTime": 1790352000}
+    requested = []
+    client, _ = make_client({
+        "station/list": lambda b: ok(total=1, stationList=[station]),
+        "station/history": lambda b: requested.append(b["startAt"]) or ok(stationDataItems=[]),
+    })
+    args = dx.build_parser().parse_args(["--out", str(tmp_path), "frames", "--end", "2026-09-27"])
+    dx.cmd_frames(client, args, {})
+    assert args.tz == "Asia/Manila"
+    assert requested == ["2026-09-26", "2026-09-27"]
