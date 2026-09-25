@@ -47,7 +47,7 @@ file, so you can stop it and run it again: days already downloaded are skipped
 
 | File | What it holds |
 | --- | --- |
-| `frames/YYYY-MM-DD.csv` | ~5-minute power readings in kW, the same data as the website's History export (see below) |
+| `frames/YYYY-MM-DD.csv` | ~5-minute power readings in kW, the same data as the website's History export (see below), plus `purchasePower`/`gridPower` (buying/exporting side of Grid), `chargePower`/`dischargePower` (charging/discharging side of Battery, blank below 0.05 kW) and `generationRatio`. A blank power value means 0 |
 | `hourly.csv` | kWh per hour for each power column (average kW over the hour × 1 h), with `samples` = number of readings behind it (12 = a complete hour). Grid and battery are also split in two: `wirePower_pos_kWh` = bought from the grid, `wirePower_neg_kWh` = exported, `batteryPower_pos_kWh` = discharged, `batteryPower_neg_kWh` = charged |
 | `daily.csv` | Deye's daily totals in kWh: `generationValue`, `consumptionValue`, `purchaseValue` (bought from grid), `gridValue` (fed into grid), `chargeValue`, `dischargeValue`, … |
 

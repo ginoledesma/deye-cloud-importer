@@ -89,6 +89,13 @@ def test_hourly_rollup():
     assert h1["samples"] == 1 and "batteryPower_kWh" not in h1
 
 
+def test_hourly_counts_blank_frames_as_zero():
+    rows = [{"time": f"2026-09-25 11:{m:02d}:00", "purchasePower_kW": "0.6" if m == 10 else ""}
+            for m in range(0, 60, 5)]
+    (h,) = dx.hourly_rollup(rows)
+    assert h["purchasePower_kWh"] == 0.05  # 0.6 kW for 5 of 60 minutes
+
+
 def test_frames_command_is_resumable(tmp_path):
     requested = []
 
@@ -166,3 +173,32 @@ def test_daily_chunk_error_is_reported_not_fatal(tmp_path, capsys):
     dx.cmd_daily(client, args, {})
     assert "2101012" in capsys.readouterr().err
     assert "2026-02-01" in (tmp_path / "daily.csv").read_text()
+
+
+def test_frame_rows_keep_only_useful_columns():
+    item = {"timeStamp": 1790352000, "generationPower": 1371, "consumptionPower": 570, "wirePower": 0,
+            "batteryPower": -593, "batterySOC": 55, "chargePower": -593, "generationRatio": 100.0,
+            "generationValue": None, "irradiateIntensity": None, "pr": None, "year": 2026, "month": 9, "day": 26}
+    (row,) = dx.frames_to_rows([item], TZ, 1000)
+    assert set(row) == set(dx.frame_columns())
+    assert len(dx.frame_columns()) == 11
+    assert row["wirePower_kW"] == 0.0 and row["chargePower_kW"] == -0.593 and row["purchasePower_kW"] is None
+
+
+def test_old_frame_files_are_trimmed_without_api_calls(tmp_path):
+    old = tmp_path / "frames" / "2026-09-01.csv"
+    old.parent.mkdir(parents=True)
+    old.write_text("time,generationPower_kW,consumptionPower_kW,gridPower_kW,purchasePower_kW,wirePower_kW,"
+                   "batteryPower_kW,batterySOC,chargePower_kW,dischargePower_kW,irradiateIntensity_kW,"
+                   "generationValue,generationRatio,year,month,day\n"
+                   "2026-09-01 00:00:00,0.002,0.83,,,0.0,0.986,69.0,,0.986,,,0.0,2026,9,1\n")
+    client, session = make_client({})
+    args = dx.build_parser().parse_args(
+        ["--out", str(tmp_path), "frames", "--station", "7", "--start", "2026-09-01",
+         "--end", "2026-09-01", "--tz", "Asia/Manila"])
+    dx.cmd_frames(client, args, {})
+    assert session.calls == []
+    header, line = old.read_text().splitlines()
+    assert header.split(",") == dx.frame_columns()
+    assert line == "2026-09-01 00:00:00,0.002,0.83,0.0,0.986,69.0,,,,0.986,0.0"
+    assert dx.trim_frame_file(old) is False
