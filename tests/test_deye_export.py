@@ -89,6 +89,13 @@ def test_hourly_rollup():
     assert h1["samples"] == 1 and "batteryPower_kWh" not in h1
 
 
+def test_hourly_counts_blank_frames_as_zero():
+    rows = [{"time": f"2026-09-25 11:{m:02d}:00", "purchasePower_kW": "0.6" if m == 10 else ""}
+            for m in range(0, 60, 5)]
+    (h,) = dx.hourly_rollup(rows)
+    assert h["purchasePower_kWh"] == 0.05  # 0.6 kW for 5 of 60 minutes
+
+
 def test_frames_command_is_resumable(tmp_path):
     requested = []
 
@@ -113,7 +120,7 @@ def test_frames_command_is_resumable(tmp_path):
     assert "consumptionPower_kWh" in (tmp_path / "hourly.csv").read_text()
 
 
-def test_daily_command_chunks_by_31_days(tmp_path):
+def test_daily_command_chunks_by_30_days(tmp_path):
     requested = []
 
     def history(body):
@@ -129,7 +136,7 @@ def test_daily_command_chunks_by_31_days(tmp_path):
     args = dx.build_parser().parse_args(
         ["--out", str(tmp_path), "daily", "--station", "7", "--start", "2026-01-01", "--end", "2026-03-05"])
     dx.cmd_daily(client, args, {})
-    assert requested == [("2026-01-01", "2026-02-01"), ("2026-02-01", "2026-03-04"), ("2026-03-04", "2026-03-06")]
+    assert requested == [("2026-01-01", "2026-01-31"), ("2026-01-31", "2026-03-02"), ("2026-03-02", "2026-03-06")]
     lines = (tmp_path / "daily.csv").read_text().splitlines()
     assert lines[0].startswith("date,") and len(lines) == 1 + 64
 
@@ -152,3 +159,46 @@ def test_station_defaults_for_tz_and_start(tmp_path):
     dx.cmd_frames(client, args, {})
     assert args.tz == "Asia/Manila"
     assert requested == ["2026-09-26", "2026-09-27"]
+
+
+def test_daily_chunk_error_is_reported_not_fatal(tmp_path, capsys):
+    def history(body):
+        if body["startAt"] == "2026-01-01":
+            return {"code": "2101012", "success": False, "msg": "should be within 31 days"}
+        return ok(stationDataItems=[{"year": 2026, "month": 2, "day": 1, "consumptionValue": 5.0}])
+
+    client, _ = make_client({"station/history": history})
+    args = dx.build_parser().parse_args(
+        ["--out", str(tmp_path), "daily", "--station", "7", "--start", "2026-01-01", "--end", "2026-02-10"])
+    dx.cmd_daily(client, args, {})
+    assert "2101012" in capsys.readouterr().err
+    assert "2026-02-01" in (tmp_path / "daily.csv").read_text()
+
+
+def test_frame_rows_keep_only_useful_columns():
+    item = {"timeStamp": 1790352000, "generationPower": 1371, "consumptionPower": 570, "wirePower": 0,
+            "batteryPower": -593, "batterySOC": 55, "chargePower": -593, "generationRatio": 100.0,
+            "generationValue": None, "irradiateIntensity": None, "pr": None, "year": 2026, "month": 9, "day": 26}
+    (row,) = dx.frames_to_rows([item], TZ, 1000)
+    assert set(row) == set(dx.frame_columns())
+    assert len(dx.frame_columns()) == 11
+    assert row["wirePower_kW"] == 0.0 and row["chargePower_kW"] == -0.593 and row["purchasePower_kW"] is None
+
+
+def test_old_frame_files_are_trimmed_without_api_calls(tmp_path):
+    old = tmp_path / "frames" / "2026-09-01.csv"
+    old.parent.mkdir(parents=True)
+    old.write_text("time,generationPower_kW,consumptionPower_kW,gridPower_kW,purchasePower_kW,wirePower_kW,"
+                   "batteryPower_kW,batterySOC,chargePower_kW,dischargePower_kW,irradiateIntensity_kW,"
+                   "generationValue,generationRatio,year,month,day\n"
+                   "2026-09-01 00:00:00,0.002,0.83,,,0.0,0.986,69.0,,0.986,,,0.0,2026,9,1\n")
+    client, session = make_client({})
+    args = dx.build_parser().parse_args(
+        ["--out", str(tmp_path), "frames", "--station", "7", "--start", "2026-09-01",
+         "--end", "2026-09-01", "--tz", "Asia/Manila"])
+    dx.cmd_frames(client, args, {})
+    assert session.calls == []
+    header, line = old.read_text().splitlines()
+    assert header.split(",") == dx.frame_columns()
+    assert line == "2026-09-01 00:00:00,0.002,0.83,0.0,0.986,69.0,,,,0.986,0.0"
+    assert dx.trim_frame_file(old) is False

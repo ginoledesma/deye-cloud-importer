@@ -9,7 +9,7 @@ Endpoints used (see https://developer.deyecloud.com/api):
   POST /v1.0/account/token?appId=...   -> accessToken
   POST /v1.0/station/list              -> your stations and their ids
   POST /v1.0/station/history           -> granularity 1 = frames for one day,
-                                          granularity 2 = daily totals (<=31 days/call)
+                                          granularity 2 = daily totals (30 days/call)
 
 Usage:
   python deye_export.py stations
@@ -42,19 +42,25 @@ DEFAULT_BASE_URL = "https://eu1-developer.deyecloud.com"
 
 # Station frame fields that hold instantaneous power. The API reports them in
 # watts; the website export shows kW, so they are converted.
+# Column mapping checked against a website export: all 289 frames of a day match.
 POWER_FIELDS = [
-    "generationPower",   # website: Production
+    "generationPower",   # website: Production (and PV, when there's no generator)
     "consumptionPower",  # website: Consumption
-    "gridPower",         # website: Grid
-    "purchasePower",     # power bought from the grid
-    "wirePower",         # power fed into the grid
-    "batteryPower",      # website: Battery (positive = discharging)
+    "wirePower",         # website: Grid (positive = buying, negative = exporting)
+    "batteryPower",      # website: Battery (positive = discharging, negative = charging)
+    "purchasePower",     # buying side of wirePower only
+    "gridPower",         # exporting side of wirePower only
     "chargePower",
     "dischargePower",
-    "irradiateIntensity",
 ]
+# Non-power frame fields worth keeping. The API's other fields (daily totals,
+# irradiance, performance ratios, year/month/day) are always empty in frames
+# or repeat `time`.
+FRAME_EXTRA_FIELDS = ["batterySOC", "generationRatio"]
+# Days per granularity=2 request (see DeyeClient.station_daily).
+DAILY_CHUNK_DAYS = 30
 # Signed fields that get split into positive/negative energy in the hourly roll-up.
-SIGNED_FIELDS = ["gridPower", "batteryPower"]
+SIGNED_FIELDS = ["wirePower", "batteryPower"]
 
 
 # --------------------------------------------------------------------------- config
@@ -176,7 +182,11 @@ class DeyeClient:
         return data.get("stationDataItems") or []
 
     def station_daily(self, station_id: int, start: date, end_exclusive: date) -> list[dict]:
-        """Daily energy totals, start..end_exclusive (API allows at most 31 days)."""
+        """Daily energy totals, start..end_exclusive.
+
+        The docs say "up to 31 days", but the API answers a 31-day span with
+        code 2101012 "should be within 31 days", so callers use 30.
+        """
         data = self._request("station/history", {
             "stationId": station_id, "granularity": 2,
             "startAt": start.isoformat(), "endAt": end_exclusive.isoformat(),
@@ -213,21 +223,18 @@ def to_float(value) -> float | None:
 
 
 def frames_to_rows(items: list[dict], tz: ZoneInfo, power_divisor: float) -> list[dict]:
-    """Normalise raw frame items: local time, power fields in kW, other fields as-is."""
+    """Normalise raw frame items: local time, power fields in kW, only the useful fields."""
     rows = {}
     for item in items:
         ts = parse_timestamp(item.get("timeStamp"), tz)
         if ts is None:
             continue
         row = {"time": ts.strftime("%Y-%m-%d %H:%M:%S")}
-        for key, value in item.items():
-            if key == "timeStamp":
-                continue
-            if key in POWER_FIELDS:
-                num = to_float(value)
-                row[f"{key}_kW"] = None if num is None else round(num / power_divisor, 4)
-            else:
-                row[key] = value
+        for key in POWER_FIELDS:
+            num = to_float(item.get(key))
+            row[f"{key}_kW"] = None if num is None else round(num / power_divisor, 4)
+        for key in FRAME_EXTRA_FIELDS:
+            row[key] = item.get(key)
         rows[row["time"]] = row
     return [rows[k] for k in sorted(rows)]
 
@@ -249,7 +256,21 @@ def write_csv(path: Path, rows: list[dict], lead: list[str] | None = None) -> No
 
 
 def frame_columns() -> list[str]:
-    return ["time"] + [f"{k}_kW" for k in POWER_FIELDS[:6]] + ["batterySOC"]
+    """Website export's columns first (Production, Consumption, Grid, Battery, SOC), then the rest."""
+    return ["time"] + [f"{k}_kW" for k in POWER_FIELDS[:4]] + ["batterySOC"] + \
+        [f"{k}_kW" for k in POWER_FIELDS[4:]] + ["generationRatio"]
+
+
+def trim_frame_file(path: Path) -> bool:
+    """Rewrite a frame file saved by an older version to the current columns. True if changed."""
+    with path.open(newline="") as f:
+        header = next(csv.reader(f), [])
+    cols = frame_columns()
+    if header == cols:
+        return False
+    rows = [{c: r.get(c) for c in cols} for r in read_csv(path)]
+    write_csv(path, rows, cols)
+    return True
 
 
 def hourly_rollup(frame_rows: list[dict]) -> list[dict]:
@@ -268,9 +289,12 @@ def hourly_rollup(frame_rows: list[dict]) -> list[dict]:
         rec = {"hour": hour, "samples": len(rows)}
         power_cols = [c for c in rows[0] if c.endswith("_kW")]
         for col in power_cols:
-            vals = [v for v in (to_float(r.get(col)) for r in rows) if v is not None]
-            if not vals:
+            raw = [to_float(r.get(col)) for r in rows]
+            if all(v is None for v in raw):
                 continue
+            # Deye leaves a field blank when it is zero (e.g. purchasePower when
+            # not buying), so a blank in a frame counts as 0 kW, not as missing.
+            vals = [v or 0.0 for v in raw]
             name = col[:-3]
             rec[f"{name}_kWh"] = round(sum(vals) / len(vals), 4)
             if name in SIGNED_FIELDS:
@@ -338,12 +362,13 @@ def cmd_frames(client: DeyeClient, args, env) -> None:
     tz = ZoneInfo(args.tz) if args.tz else _local_tz()
     out_dir = Path(args.out) / "frames"
     today = datetime.now(tz).date()
-    fetched = skipped = failed = 0
+    fetched = skipped = trimmed = failed = 0
     for day in daterange(args.start, args.end):
         path = out_dir / f"{day.isoformat()}.csv"
         # Today's (or a future) file is incomplete, so always refetch it.
         if path.exists() and not args.refetch and day < today:
             skipped += 1
+            trimmed += trim_frame_file(path)
             continue
         try:
             items = client.station_frames(station, day)
@@ -356,6 +381,8 @@ def cmd_frames(client: DeyeClient, args, env) -> None:
         fetched += 1
         print(f"{day}: {len(rows)} frames")
     print(f"frames: {fetched} days fetched, {skipped} already on disk, {failed} failed -> {out_dir}")
+    if trimmed:
+        print(f"frames: removed empty columns from {trimmed} older file(s)")
     if failed:
         print("Re-run the same command to retry failed days.", file=sys.stderr)
 
@@ -377,10 +404,18 @@ def cmd_hourly(client, args, env) -> None:
 def cmd_daily(client: DeyeClient, args, env) -> None:
     station = resolve_station(client, env, args)
     rows: dict[str, dict] = {}
+    failed = 0
     start = args.start
     while start <= args.end:
-        end_excl = min(start + timedelta(days=31), args.end + timedelta(days=1))
-        for item in client.station_daily(station, start, end_excl):
+        end_excl = min(start + timedelta(days=DAILY_CHUNK_DAYS), args.end + timedelta(days=1))
+        try:
+            items = client.station_daily(station, start, end_excl)
+        except DeyeError as e:
+            print(f"daily: {start} .. {end_excl - timedelta(days=1)}: ERROR {e}", file=sys.stderr)
+            failed += 1
+            start = end_excl
+            continue
+        for item in items:
             y, m, d = item.get("year"), item.get("month"), item.get("day")
             if not (y and m and d):
                 continue
@@ -393,6 +428,8 @@ def cmd_daily(client: DeyeClient, args, env) -> None:
     path = Path(args.out) / "daily.csv"
     write_csv(path, [rows[k] for k in sorted(rows)], ["date"])
     print(f"daily: {len(rows)} days -> {path}")
+    if failed:
+        print(f"daily: {failed} chunk(s) failed; re-run 'daily' to retry.", file=sys.stderr)
 
 
 def cmd_all(client, args, env) -> None:
