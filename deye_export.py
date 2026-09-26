@@ -10,6 +10,7 @@ Endpoints used (see https://developer.deyecloud.com/api):
   POST /v1.0/station/list              -> your stations and their ids
   POST /v1.0/station/history           -> granularity 1 = frames for one day,
                                           granularity 2 = daily totals (30 days/call)
+  Read-only settings (the `config` command) -- see cmd_config.
 
 Usage:
   python deye_export.py stations
@@ -17,6 +18,7 @@ Usage:
   python deye_export.py hourly
   python deye_export.py daily  --start 2024-01-01 --end 2026-09-25
   python deye_export.py all                     # everything since the station started
+  python deye_export.py config                  # snapshot of station/inverter settings
 
 Configuration comes from environment variables or a .env file next to this
 script (see .env.example).
@@ -27,6 +29,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
 import os
 import sys
 import time
@@ -193,6 +196,60 @@ class DeyeClient:
         })
         return data.get("stationDataItems") or []
 
+    # --- read-only settings. Never call the /order/* endpoints from here: they change the inverter.
+
+    def station_detail(self, station_id: int) -> dict:
+        return strip_envelope(self._request("station/detail", {"stationId": station_id})).get("station") or {}
+
+    def station_devices(self, station_id: int) -> list[dict]:
+        out, page = [], 1
+        while True:
+            data = self._request("station/device", {"stationIds": [station_id], "page": page, "size": 200})
+            items = data.get("deviceListItems") or []
+            out.extend(items)
+            if len(items) < 200 or len(out) >= int(data.get("total") or 0):
+                return out
+            page += 1
+
+    def device_latest(self, device_sns: list[str]) -> list[dict]:
+        out = []
+        for i in range(0, len(device_sns), 10):  # API limit: 10 devices per call
+            out.extend(self._request("device/latest", {"deviceList": device_sns[i:i + 10]}).get("deviceDataList") or [])
+        return out
+
+    def device_measure_points(self, sn: str, device_type: str) -> dict:
+        return strip_envelope(self._request("device/measurePoints", {"deviceSn": sn, "deviceType": device_type}))
+
+    def device_config(self, sn: str, kind: str) -> dict:
+        """kind: battery, system or tou (/v1.0/config/<kind>)."""
+        return strip_envelope(self._request(f"config/{kind}", {"deviceSn": sn}))
+
+    def read_dynamic_control(self, sn: str, timeout: float = 90, poll: float = 5) -> dict:
+        """Ask the inverter for its current settings, then poll for the answer.
+
+        This sends a *read* command through the data logger; it doesn't change anything.
+        """
+        order = self._request("strategy/dynamicControl/read", {"deviceSn": sn})
+        order_id = order.get("orderId")
+        if not order_id:
+            raise DeyeError(f"no orderId in dynamicControl/read response: {order.get('msg')}")
+        deadline = time.time() + timeout
+        last_err = None
+        while time.time() < deadline:
+            time.sleep(poll)
+            try:
+                result = strip_envelope(self._request("strategy/dynamicControl/readResult", {"orderId": order_id}))
+            except DeyeError as e:  # typically "still waiting for the device"
+                last_err = e
+                continue
+            if any(v not in (None, [], "") for v in result.values()):
+                return result
+        raise DeyeError(f"inverter didn't answer within {timeout:.0f}s (order {order_id}): {last_err}")
+
+
+def strip_envelope(data: dict) -> dict:
+    return {k: v for k, v in data.items() if k not in ("code", "msg", "requestId", "success")}
+
 
 # --------------------------------------------------------------------------- transforms
 
@@ -328,7 +385,8 @@ def resolve_station(client: DeyeClient, env: dict, args) -> int:
     sid = args.station or env.get("DEYE_STATION_ID")
     station = None
     needs_tz = hasattr(args, "tz") and not args.tz
-    if not sid or not args.start or needs_tz:
+    needs_start = hasattr(args, "start") and not args.start
+    if not sid or needs_start or needs_tz:
         stations = client.stations()
         if sid:
             station = next((s for s in stations if str(s.get("id")) == str(sid)), None)
@@ -341,6 +399,8 @@ def resolve_station(client: DeyeClient, env: dict, args) -> int:
     station = station or {}
     if needs_tz:
         args.tz = station.get("regionTimezone") or None
+    if not hasattr(args, "start"):
+        return int(sid)
     if not args.start:
         started = parse_timestamp(station.get("startOperatingTime"), ZoneInfo(args.tz) if getattr(args, "tz", None) else _local_tz())
         if not started:
@@ -432,6 +492,93 @@ def cmd_daily(client: DeyeClient, args, env) -> None:
         print(f"daily: {failed} chunk(s) failed; re-run 'daily' to retry.", file=sys.stderr)
 
 
+CONFIG_KINDS = ("battery", "system", "tou")
+# Device types the /config/* endpoints apply to.
+CONFIGURABLE_TYPES = {"INVERTER", "MICRO_STORAGE_IN_ONE"}
+
+
+def _try(fn, *a):
+    try:
+        return fn(*a)
+    except DeyeError as e:
+        return {"error": str(e)}
+
+
+def collect_config(client: DeyeClient, station_id: int, read_inverter: bool = False) -> dict:
+    """Snapshot of everything readable about the station's setup. Errors are kept, not fatal."""
+    devices = client.station_devices(station_id)
+    latest_list = _try(client.device_latest, [d["deviceSn"] for d in devices]) if devices else []
+    latest_error = latest_list.get("error") if isinstance(latest_list, dict) else None
+    latest = {d.get("deviceSn"): d for d in latest_list} if not latest_error else {}
+    out_devices = []
+    for dev in devices:
+        sn, dtype = dev.get("deviceSn"), dev.get("deviceType") or "INVERTER"
+        entry = {**dev, "latest": latest.get(sn) or ({"error": latest_error} if latest_error else None)}
+        if dtype in CONFIGURABLE_TYPES:
+            entry["measurePoints"] = _try(client.device_measure_points, sn, dtype)
+            entry["config"] = {kind: _try(client.device_config, sn, kind) for kind in CONFIG_KINDS}
+            if read_inverter:
+                print(f"{sn}: asking the inverter for its settings (can take a minute)...")
+                entry["config"]["dynamicControl"] = _try(client.read_dynamic_control, sn)
+        out_devices.append(entry)
+    return {
+        "exportedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "station": _try(client.station_detail, station_id),
+        "devices": out_devices,
+    }
+
+
+def flatten_config(snapshot: dict) -> list[dict]:
+    """One row per setting: device, section, key, value, unit. Easy to diff between snapshots."""
+    rows = []
+
+    def add(device, section, key, value, unit=""):
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, ensure_ascii=False)
+        rows.append({"device": device, "section": section, "key": key, "value": value, "unit": unit})
+
+    for k, v in (snapshot.get("station") or {}).items():
+        add("station", "station", k, v)
+    for dev in snapshot.get("devices", []):
+        sn = f"{dev.get('deviceType')}:{dev.get('deviceSn')}"
+        for k, v in dev.items():
+            if k not in ("latest", "config", "measurePoints"):
+                add(sn, "device", k, v)
+        for section, cfg in (dev.get("config") or {}).items():
+            for k, v in cfg.items():
+                if k in ("timeUseSettingItems",) and isinstance(v, list):
+                    for i, slot in enumerate(v, 1):
+                        for sk, sv in slot.items():
+                            add(sn, section, f"slot{i}.{sk}", sv)
+                else:
+                    add(sn, section, k, v)
+        latest = dev.get("latest") or {}
+        for item in latest.get("dataList") or []:
+            add(sn, "latest", item.get("key") or item.get("name"), item.get("value"), item.get("unit") or "")
+        mp = dev.get("measurePoints") or {}
+        if mp.get("measurePoints"):
+            add(sn, "measurePoints", "names", ", ".join(mp["measurePoints"]))
+    return rows
+
+
+def cmd_config(client: DeyeClient, args, env) -> None:
+    station = resolve_station(client, env, args)
+    snapshot = collect_config(client, station, args.read_inverter)
+    out_dir = Path(args.out) / "config"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    json_path = out_dir / f"config-{stamp}.json"
+    json_path.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False))
+    rows = flatten_config(snapshot)
+    csv_path = out_dir / f"config-{stamp}.csv"
+    write_csv(csv_path, rows, ["device", "section", "key", "value", "unit"])
+    for dev in snapshot["devices"]:
+        errs = [f"{s}: {c['error']}" for s, c in (dev.get("config") or {}).items() if "error" in c]
+        for e in errs:
+            print(f"{dev.get('deviceSn')}: {e}", file=sys.stderr)
+    print(f"config: {len(snapshot['devices'])} device(s), {len(rows)} settings -> {json_path} and {csv_path.name}")
+
+
 def cmd_all(client, args, env) -> None:
     cmd_frames(client, args, env)
     cmd_hourly(client, args, env)
@@ -470,11 +617,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="divide API power values by this to get kW (default 1000: API reports W)")
     ranged("daily", "Deye's daily energy totals (kWh) into daily.csv")
     sub.add_parser("hourly", help="roll up downloaded frames into hourly.csv (no API calls)")
+    sp = sub.add_parser("config", help="snapshot of station, device, battery, work-mode and TOU settings")
+    sp.add_argument("--station", help="station id (default: DEYE_STATION_ID or your only station)")
+    sp.add_argument("--read-inverter", action="store_true",
+                    help="also send a read command to the inverter for its live settings "
+                         "(grid charge, solar sell, TOU days, work mode); read-only, takes up to ~90 s")
     return p
 
 
 COMMANDS = {"stations": cmd_stations, "frames": cmd_frames, "hourly": cmd_hourly,
-            "daily": cmd_daily, "all": cmd_all}
+            "daily": cmd_daily, "all": cmd_all, "config": cmd_config}
 
 
 def main(argv=None) -> None:

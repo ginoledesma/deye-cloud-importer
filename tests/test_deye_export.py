@@ -202,3 +202,64 @@ def test_old_frame_files_are_trimmed_without_api_calls(tmp_path):
     assert header.split(",") == dx.frame_columns()
     assert line == "2026-09-01 00:00:00,0.002,0.83,0.0,0.986,69.0,,,,0.986,0.0"
     assert dx.trim_frame_file(old) is False
+
+
+def config_routes(read_calls):
+    results = iter([{"code": "2101030", "success": False, "msg": "waiting for device"},
+                    ok(workMode="ZERO_EXPORT_TO_CT", solarSellAction="off", touDays=["MONDAY"])])
+    return {
+        "station/detail": lambda b: ok(station={"id": b["stationId"], "name": "Home", "installedCapacity": 10.0}),
+        "station/device": lambda b: ok(total=2, deviceListItems=[
+            {"deviceSn": "INV1", "deviceType": "INVERTER", "stationId": 7},
+            {"deviceSn": "LOG1", "deviceType": "COLLECTOR", "stationId": 7}]),
+        "device/latest": lambda b: ok(deviceDataList=[
+            {"deviceSn": "INV1", "deviceType": "INVERTER", "collectionTime": 1790352000,
+             "dataList": [{"key": "SOC", "value": "58", "unit": "%"}]}]),
+        "device/measurePoints": lambda b: ok(deviceSn=b["deviceSn"], measurePoints=["SOC", "BatteryPower"]),
+        "config/battery": lambda b: ok(battCapacity=280, battLowCapacity=20, maxChargeCurrent=100),
+        "config/system": lambda b: {"code": "2101999", "success": False, "msg": "not supported"},
+        "config/tou": lambda b: ok(touAction="on", timeUseSettingItems=[
+            {"time": "00:00", "power": 5000, "soc": 20, "enableGridCharge": False},
+            {"time": "06:00", "power": 5000, "soc": 30, "enableGridCharge": True}]),
+        "strategy/dynamicControl/read": lambda b: read_calls.append(b) or ok(orderId=99),
+        "strategy/dynamicControl/readResult": lambda b: next(results),
+    }
+
+
+def test_config_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(dx.time, "sleep", lambda s: None)
+    read_calls = []
+    client, session = make_client(config_routes(read_calls))
+    args = dx.build_parser().parse_args(["--out", str(tmp_path), "config", "--station", "7", "--read-inverter"])
+    dx.cmd_config(client, args, {})
+
+    paths = [c[0] for c in session.calls]
+    assert not any(p.startswith("order/") for p in paths)  # never touches control endpoints
+    assert paths.count("config/battery") == 1  # only for the inverter, not the collector
+    assert read_calls == [{"deviceSn": "INV1"}]
+
+    (json_file,) = (tmp_path / "config").glob("config-*.json")
+    snap = dx.json.loads(json_file.read_text())
+    inv, logger = snap["devices"]
+    assert snap["station"]["name"] == "Home"
+    assert inv["config"]["battery"] == {"battCapacity": 280, "battLowCapacity": 20, "maxChargeCurrent": 100}
+    assert "not supported" in inv["config"]["system"]["error"]
+    assert inv["config"]["dynamicControl"]["workMode"] == "ZERO_EXPORT_TO_CT"
+    assert inv["latest"]["dataList"][0]["key"] == "SOC"
+    assert "config" not in logger
+
+    rows = dx.read_csv(json_file.with_suffix(".csv"))
+    keyed = {(r["device"], r["section"], r["key"]): r for r in rows}
+    assert keyed[("INVERTER:INV1", "tou", "slot2.enableGridCharge")]["value"] == "True"
+    assert keyed[("INVERTER:INV1", "latest", "SOC")]["unit"] == "%"
+    assert keyed[("INVERTER:INV1", "dynamicControl", "touDays")]["value"] == '["MONDAY"]'
+    assert keyed[("station", "station", "installedCapacity")]["value"] == "10.0"
+
+
+def test_config_without_read_inverter_sends_no_command(tmp_path):
+    read_calls = []
+    client, session = make_client(config_routes(read_calls))
+    args = dx.build_parser().parse_args(["--out", str(tmp_path), "config", "--station", "7"])
+    dx.cmd_config(client, args, {})
+    assert read_calls == []
+    assert not any(c[0].startswith("strategy/") for c in session.calls)

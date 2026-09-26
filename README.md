@@ -69,6 +69,39 @@ columns need the per-device endpoint. That's `/v1.0/device/history`
 
 Power values come back from the API in watts and are converted to kW.
 
+## Settings snapshot
+
+```sh
+python deye_export.py config                  # station, devices, battery, work mode, TOU
+python deye_export.py config --read-inverter  # also ask the inverter itself (takes up to ~90 s)
+```
+
+Each run writes a timestamped pair to `export/config/`. Keep them to track
+changes over time:
+
+- `config-YYYYMMDD-HHMMSS.json`: everything as the API returned it.
+- `config-YYYYMMDD-HHMMSS.csv`: one row per setting (`device, section, key, value, unit`),
+  so two snapshots can be compared with any diff tool.
+
+| Section | Source | What's in it |
+| --- | --- | --- |
+| `station` | `/station/detail` | name, location, time zone, installed capacity, grid connection type, start date |
+| `device` | `/station/device` | each device (inverter, data logger, ...): serial number, type, online status |
+| `battery` | `/config/battery` | battery capacity, low and shutdown SOC, max charge/discharge current |
+| `system` | `/config/system` | system work mode, energy pattern, max sell / max solar / zero-export power |
+| `tou` | `/config/tou` | time-of-use on/off and each time slot (`slotN.time`, `power`, `soc`, `enableGridCharge`, `enableGeneration`) |
+| `dynamicControl` | `/strategy/dynamicControl/read` (only with `--read-inverter`) | settings read from the inverter itself: work mode, grid charge on/off and amps, solar sell on/off, TOU days, time slots including `enableSell` |
+| `latest` | `/device/latest` | every value the inverter last reported, with units. This includes readings and any settings it reports |
+| `measurePoints` | `/device/measurePoints` | names of all values the device can report |
+
+Battery, system and TOU settings only exist for inverters. If an endpoint
+fails for your inverter model, the error is stored in the snapshot and the rest
+is still saved.
+
+This command only reads. It never calls the API's `/order/*` endpoints, which
+change inverter settings. `--read-inverter` sends a *read* request through
+the data logger and waits for the reply. Nothing on the inverter changes.
+
 ## Tests
 
 ```sh
